@@ -1,6 +1,8 @@
 "use server";
 
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { ensureLumeCalendar, createGoogleEvent } from "@/lib/google/calendar";
 
 export type CreateSessionInput = {
   patient_id: string;
@@ -76,14 +78,134 @@ export async function createSession(input: CreateSessionInput) {
   const { data: userData, error: userErr } = await supabase.auth.getUser();
   if (userErr || !userData.user) throw new Error("Not authenticated");
 
-  const { error } = await supabase.from("sessions").insert({
-    psychologist_id: userData.user.id,
-    patient_id: input.patient_id,
-    starts_at: input.starts_at,
-    ends_at: input.ends_at,
-    status: "scheduled",
-    payment_status: "pending",
-  });
+  const userId = userData.user.id;
 
-  if (error) throw new Error(error.message);
+  const { data: created, error: insertErr } = await supabase
+    .from("sessions")
+    .insert({
+      psychologist_id: userId,
+      patient_id: input.patient_id,
+      starts_at: input.starts_at,
+      ends_at: input.ends_at,
+      status: "scheduled",
+      payment_status: "pending",
+      gcal_sync_status: "pending",
+    })
+    .select("id")
+    .single();
+
+  if (insertErr) throw new Error(insertErr.message);
+
+  const sessionId = created.id as string;
+
+  const { data: patient, error: patientErr } = await supabase
+    .from("patients")
+    .select("full_name")
+    .eq("id", input.patient_id)
+    .single();
+
+  if (patientErr) {
+    const admin = createSupabaseAdminClient();
+    await admin
+      .from("sessions")
+      .update({
+        gcal_sync_status: "error",
+        gcal_error: `Failed to load patient: ${patientErr.message}`,
+        gcal_last_sync_at: new Date().toISOString(),
+      })
+      .eq("id", sessionId)
+      .eq("psychologist_id", userId);
+
+    return { session_id: sessionId };
+  }
+
+  const admin = createSupabaseAdminClient();
+
+  try {
+    const { data: integration, error: integErr } = await admin
+      .from("calendar_integrations")
+      .select("refresh_token, calendar_id")
+      .eq("psychologist_id", userId)
+      .eq("provider", "google")
+      .maybeSingle();
+
+    if (integErr) throw new Error(integErr.message);
+    if (!integration) throw new Error("Google Calendar não conectado");
+
+    const { calendar, calendarId } = await ensureLumeCalendar(
+      admin,
+      {
+        psychologist_id: userId,
+        provider: "google",
+        calendar_id: integration.calendar_id,
+        refresh_token: integration.refresh_token,
+      }
+    );
+
+    if (!integration.calendar_id || integration.calendar_id !== calendarId) {
+      const { error: updErr } = await admin
+        .from("calendar_integrations")
+        .update({
+          calendar_id: calendarId,
+          token_updated_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("psychologist_id", userId)
+        .eq("provider", "google");
+
+      if (updErr) throw new Error(updErr.message);
+    }
+
+    const { data: existingMap, error: mapErr } = await admin
+      .from("calendar_event_map")
+      .select("google_event_id")
+      .eq("psychologist_id", userId)
+      .eq("session_id", sessionId)
+      .eq("provider", "google")
+      .maybeSingle();
+
+    if (mapErr) throw new Error(mapErr.message);
+
+    let googleEventId = existingMap?.google_event_id as string | undefined;
+
+    if (!googleEventId) {
+      googleEventId = await createGoogleEvent(
+        admin,
+        calendar,
+        calendarId,
+        {
+          id: sessionId,
+          psychologist_id: userId,
+          starts_at: input.starts_at,
+          ends_at: input.ends_at,
+          patient_name: patient.full_name,
+        }
+      );
+    }
+
+    const { error: syncUpdErr } = await admin
+      .from("sessions")
+      .update({
+        gcal_sync_status: "synced",
+        gcal_error: null,
+        gcal_last_sync_at: new Date().toISOString(),
+      })
+      .eq("id", sessionId)
+      .eq("psychologist_id", userId);
+
+    if (syncUpdErr) throw new Error(syncUpdErr.message);
+
+  } catch (err: any) {
+    await admin
+      .from("sessions")
+      .update({
+        gcal_sync_status: "error",
+        gcal_error: String(err?.message ?? err),
+        gcal_last_sync_at: new Date().toISOString(),
+      })
+      .eq("id", sessionId)
+      .eq("psychologist_id", userId);
+  }
+
+  return { session_id: sessionId };
 }

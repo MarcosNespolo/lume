@@ -1,6 +1,9 @@
 import { listActivePatients, listUpcomingSessions } from "@/lib/agenda/actions";
 import { NewSessionModal } from "@/components/agenda/new-session-modal";
 import type { UpcomingSession } from "@/lib/agenda/actions";
+import { ConnectGoogleCalendarButton } from "@/components/google/connect-google-calendar-button";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { persistGoogleRefreshTokenIfPresent } from "@/lib/google/actions";
 
 function startOfDay(d: Date) {
   const x = new Date(d);
@@ -74,6 +77,22 @@ export default async function AgendaPage() {
   const todayGroups = groupByDay(todayItems);
   const upcomingGroups = groupByDay(upcomingItems);
 
+  
+  const supabase = await createSupabaseServerClient();
+  const { data } = await supabase.auth.getUser();
+  const userId = data.user?.id;
+
+  if (userId) {
+    const { data: integration } = await supabase
+      .from("calendar_integrations_safe")
+      .select("*")
+      .maybeSingle();
+
+    if (!integration) {
+      await persistGoogleRefreshTokenIfPresent();
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
@@ -85,6 +104,9 @@ export default async function AgendaPage() {
         </div>
         <NewSessionModal patients={patients} />
       </div>
+
+     <ConnectGoogleCalendarButton />
+
 
       {/* HOJE */}
       <section className="rounded-lg border bg-white">
